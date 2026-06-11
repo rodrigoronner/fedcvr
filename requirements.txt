@@ -1,0 +1,17 @@
+# FedCVR – Python dependencies
+# Tested with Python 3.10 / 3.11
+
+# Federated learning framework
+flwr[simulation]>=1.7.0,<2.0.0
+
+# Deep learning
+torch>=2.0.0
+
+# Data science
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+scipy>=1.10.0
+
+# Plotting
+matplotlib>=3.7.0
