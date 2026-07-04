@@ -1,10 +1,10 @@
-# FedCVR – Python dependencies
-# Tested with Python 3.10 / 3.11
+# FedCVR dependencies
+# Python 3.10 / 3.11 recommended
 
 # Federated learning framework
 flwr[simulation]>=1.7.0,<2.0.0
 
-# Deep learning
+# Deep learning (XeLaTeX-compatible, CPU-only experiments)
 torch>=2.0.0
 
 # Data science

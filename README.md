@@ -1,130 +1,92 @@
-# FedCVR – Federated Cardiovascular Risk Prediction
+# FedCVR: Validating Adaptive Federated Learning Under Differential Privacy for Cardiovascular Risk Prediction
 
-Anonymous implementation accompanying the manuscript *"Overcoming Clinical
-Data Heterogeneity: A Secure Federated Framework for Cardiovascular Risk
-Prediction"* (under double-blind review).
+**Paper:** *Validating the FedCVR Framework on Real Heterogeneous Clinical Datasets: Adaptive Federated Learning Under Differential Privacy for Cardiovascular Risk Prediction*
+**Authors:** Rodrigo Tertulino, Ricardo Almeida, Laercio Alencar
+**Affiliation:** IFRN - Federal Institute of Education, Science and Technology of Rio Grande do Norte, Mossoro, RN, Brazil
+**Repository:** https://github.com/rodrigoronner/fedcvr
 
 ---
 
 ## Overview
 
-FedCVR is a federated learning framework for cardiovascular risk prediction
-across institutionally siloed, heterogeneous clinical datasets. It combines:
+FedCVR validates the server-side adaptive aggregation mechanism introduced in Tertulino and Alencar (2026) on five real publicly available cardiovascular datasets, extending the original synthetic-data case study to genuine multi-institutional heterogeneous data. The framework addresses two simultaneous challenges in clinical federated learning: statistical heterogeneity (non-IID data) and Differential Privacy noise corruption.
 
-**Adaptive server aggregation** — instead of plain weighted averaging, the
-server applies a bias-corrected Adam-style moment estimator to the
-aggregated pseudo-gradient, stabilising convergence under non-IID data.
+**Key architectural components:**
 
-**Client-side Differential Privacy** — each client clips its model update
-to L2 norm `C` and adds calibrated Gaussian noise `N(0, σ²C²I)` before
-transmission, so the server never observes an unperturbed update
-(client-level DP).
-
-```
-                ┌──────────────────────────────────────────────────┐
-                │                   FL Server                      │
-                │   w_{t+1} = w_t + η · m̂_t / (√v̂_t + ε_opt)      │
-                │   (bias-corrected adaptive moment aggregation)   │
-                └────────┬──────────────┬──────────────────────────┘
-                         │              │  broadcast w_t
-           ┌─────────────┘              └──────────────┐
-           ▼                                           ▼
-  ┌──────────────────┐                       ┌──────────────────┐
-  │  Client 0        │        · · ·          │  Client 4        │
-  │  Framingham      │                       │  Long Beach VA   │
-  │                  │                       │                  │
-  │  1. Local Adam   │                       │  1. Local Adam   │
-  │     (5 epochs)   │                       │     (5 epochs)   │
-  │  2. DP: clip Δθ  │                       │  2. DP: clip Δθ  │
-  │     + Gaussian   │                       │     + Gaussian   │
-  │     noise        │                       │     noise        │
-  └──────────────────┘                       └──────────────────┘
-```
+- **Adaptive server aggregation:** Adam-style bias-corrected moment estimation acting as a temporal denoiser for DP noise (Equations 3 to 6 in the paper).
+- **Client-level Differential Privacy:** update-level gradient clipping and Gaussian noise injection applied to the model update vector before transmission (Equations 8 and 9). The server never receives an unperturbed update.
+- **13-feature UCI schema:** harmonized feature set covering the five real cardiovascular datasets.
+- **Leave-one-institution-out cross-validation:** client-level evaluation protocol measuring generalization to entirely unseen healthcare institutions.
 
 ---
 
-## Method summary (matches the manuscript)
-
-### Model architecture (Section 3.2)
+## Server Update Rule (Equation 6)
 
 ```
-Input(13) → Linear(64) → ReLU → Dropout(0.3)
-          → Linear(32) → ReLU → Dropout(0.3)
-          → Linear(1)  → Sigmoid
+Delta_t  = FedAvg(client_parameters) - w_t       (pseudo-gradient)
+m_t      = beta_1 * m_{t-1} + (1 - beta_1) * Delta_t
+v_t      = beta_2 * v_{t-1} + (1 - beta_2) * Delta_t^2
+m_hat_t  = m_t / (1 - beta_1^t)
+v_hat_t  = v_t / (1 - beta_2^t)
+w_{t+1}  = w_t + eta * m_hat_t / (sqrt(v_hat_t) + eps_opt)
 ```
 
-Trained with binary cross-entropy (`BCELoss`) on sigmoid probabilities,
-Adam optimiser (lr = 0.001), batch size 32, 5 local epochs per round,
-Xavier initialisation.
+Default: eta=1.0, beta_1=0.9, beta_2=0.999, eps_opt=1e-8. Setting eta=0.0 gives plain FedAvg.
 
-### Client-side Differential Privacy (Equations 8 and 9)
+## Client-Level DP (Equations 8 and 9)
 
 ```
-Δθ      = θ_local − θ_global
-Δθ_clip = Δθ · min(1, C / ‖Δθ‖₂)          (C = 1.0)
-Δθ̃      = Δθ_clip + N(0, σ²C²I)
+Delta_clip  = Delta_theta * min(1, C / ||Delta_theta||_2)   (Eq. 8, clipping)
+Delta_noisy = Delta_clip + N(0, sigma^2 * C^2 * I)          (Eq. 9, noise)
 ```
 
-The perturbed update is transmitted; the unperturbed update never leaves
-the institution (client-level differential privacy).
+Default: C=1.0, sigma in {0.0, 0.8, 1.1, 1.5}.
 
-### Server aggregation (Equations 3 to 6)
+## Model Architecture (Section 3.2)
 
 ```
-Δ_t  = FedAvg(client_parameters) − w_t
-m_t  = β₁·m_{t-1} + (1−β₁)·Δ_t            (β₁ = 0.9)
-v_t  = β₂·v_{t-1} + (1−β₂)·Δ_t²           (β₂ = 0.999)
-m̂_t  = m_t / (1 − β₁ᵗ)
-v̂_t  = v_t / (1 − β₂ᵗ)
-w_{t+1} = w_t + η·m̂_t / (√v̂_t + ε_opt)    (η = 1.0, ε_opt = 1e-8)
+Input(13) -> Linear(64) -> ReLU -> Dropout(0.3)
+          -> Linear(32) -> ReLU -> Dropout(0.3)
+          -> Linear(1)  -> Sigmoid
 ```
 
-Setting `η = 0` disables the server optimiser (plain FedAvg baseline).
+Trained with BCELoss and Adam (lr=0.001). All linear layers use Xavier uniform initialization.
 
-### Datasets (Section 3.3.1)
+---
+
+## Datasets
 
 | Client | Institution | File |
 |--------|-------------|------|
-| 0 | Framingham Heart Study | `framingham.csv` |
-| 1 | Cleveland Clinic Foundation | `cleveland.csv` |
-| 2 | Hungarian Institute of Cardiology | `hungarian.csv` |
-| 3 | University Hospital Zurich (Switzerland) | `switzerland.csv` |
-| 4 | Long Beach VA Medical Center | `long_beach_va.csv` |
+| 0 | Framingham Heart Study | framingham.csv |
+| 1 | Cleveland Clinic Foundation | cleveland.csv |
+| 2 | Hungarian Institute of Cardiology | hungarian.csv |
+| 3 | University Hospital Zurich (Switzerland) | switzerland.csv |
+| 4 | Long Beach VA Medical Center | long_beach_va.csv |
 
-All sources are harmonised to the 13-attribute UCI Heart Disease schema.
-Attributes absent from a source (notably in the Framingham study) are
-treated as missing and imputed with site-specific medians computed on the
-training partition only. See `data/README.md` for download instructions.
-
-### Evaluation protocol (Section 3.3.3)
-
-1. Stratified 80/20 train/test split per institution BEFORE federation.
-2. Client-level 5-fold cross-validation (leave-one-institution-out).
-3. Final global model evaluated on the composite test set aggregating the
-   20% test partitions of all institutions.
-4. Paired t-tests with Bonferroni correction across folds.
+Download instructions: see `data/README.md`.
 
 ---
 
-## Repository structure
+## Repository Structure
 
 ```
 fedcvr/
 ├── fedcvr/
-│   ├── model.py              # 13→64→32→1 DNN, dropout 0.3, sigmoid output
-│   ├── client.py             # Local Adam training + update-level DP
-│   ├── strategy.py           # Adaptive (Adam-style) server aggregation
-│   └── data_utils.py         # Harmonisation to 13 features, leak-free splits
+│   ├── model.py          # 13-feature DNN: 64/32 hidden, Dropout(0.3), Sigmoid
+│   ├── client.py         # Local Adam training + update-level client-level DP
+│   ├── strategy.py       # FedCVRStrategy: Adam-style server aggregation
+│   └── data_utils.py     # Harmonization to 13-attr UCI schema
 │
 ├── experiments/
-│   ├── run_cross_validation.py   # Leave-one-client-out CV + global model
-│   ├── run_statistical_tests.py  # Paired t-tests, Bonferroni (Table 5)
-│   ├── run_comparison.py         # Convergence curves (Figure + speeds)
+│   ├── run_cross_validation.py   # Leave-one-client-out CV + global model (Tables 1, 2, 3)
+│   ├── run_statistical_tests.py  # Paired t-tests, Bonferroni correction (Table 5)
+│   ├── run_comparison.py         # Convergence curves (Figure)
 │   └── run_dp_sensitivity.py     # Privacy-utility trade-off (Table 6)
 │
-├── data/                     # Place the five CSVs here (see data/README.md)
+├── data/                         # Place CSV files here (see data/README.md)
 ├── requirements.txt
-└── README.md
+└── LICENSE
 ```
 
 ---
@@ -132,42 +94,66 @@ fedcvr/
 ## Installation
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+git clone https://github.com/rodrigoronner/fedcvr.git
+cd fedcvr
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-All experiments run on conventional CPU hardware; the compact model size
-makes GPU acceleration unnecessary.
-
----
-
-## Reproducing the paper's results
+## Reproducing the Paper Results
 
 ```bash
-# 1) Cross-validation protocol + global model (Tables 1, 2, 3)
+# 1) Cross-validation + global model (Tables 1, 2, 3)
 python -m experiments.run_cross_validation \
-    --data_dir data --rounds 100 --seeds 42 43 44 45 46 --out_dir results
+    --data_dir data --rounds 100 --seeds 42 43 44 45 46
 
 # 2) Statistical significance tests (Table 5)
 python -m experiments.run_statistical_tests \
-    --cv_csv results/cv_fold_results.csv \
-    --out_csv results/statistical_tests.csv
+    --cv_csv results/cv_fold_results.csv
 
-# 3) Convergence analysis (Figure: learning curves)
+# 3) Convergence comparison (Figure)
 python -m experiments.run_comparison --data_dir data --rounds 100
 
-# 4) DP sensitivity analysis (Table 6, privacy-utility figure)
+# 4) DP sensitivity analysis (Table 6)
 python -m experiments.run_dp_sensitivity --data_dir data --rounds 100
 ```
 
-Every number reported in the manuscript is traceable to the CSV files
-produced by these four scripts.
+Every number in the paper is traceable to the CSV files produced by these four scripts.
 
 ---
 
+## Hyperparameters (Section 3.5)
+
+| Parameter | Value |
+|-----------|-------|
+| Local optimizer | Adam, lr=0.001 |
+| Server learning rate (eta) | 1.0 |
+| beta_1 | 0.9 |
+| beta_2 | 0.999 |
+| eps_opt | 1e-8 |
+| Batch size | 32 |
+| Local epochs | 5 |
+| Communication rounds | 100 |
+| Clipping norm C | 1.0 |
+| DP sigma grid | {0.0, 0.8, 1.1, 1.5} |
+
+---
+
+## Citation
+
+If you use this code in your research, please cite:
+
+```bibtex
+@article{tertulino2026fedcvr,
+  author    = {Tertulino, Rodrigo and Almeida, Ricardo and Alencar, Laercio},
+  title     = {Validating the {FedCVR} Framework on Real Heterogeneous Clinical Datasets:
+               Adaptive Federated Learning Under Differential Privacy for Cardiovascular Risk Prediction},
+  journal   = {Journal of the Brazilian Computer Society},
+  year      = {2026},
+  publisher = {Springer}
+}
+```
+
 ## License
 
-Released under the MIT License (anonymised for double-blind review; see
-`LICENSE`). The datasets are subject to their own respective licenses;
-refer to `data/README.md` for the original sources.
+MIT License. See `LICENSE` for details. The datasets are subject to their own respective licenses; see `data/README.md`.

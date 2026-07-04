@@ -1,23 +1,32 @@
 """
-strategy.py – FedCVR server-side adaptive aggregation strategy.
+fedcvr/strategy.py
+==================
+FedCVR server-side adaptive aggregation strategy.
 
-``FedCVRStrategy`` extends Flower's ``FedAvg`` with the Adam-style server
-optimiser described in Section 3.1.2 of the paper (Equations 3 to 6):
+Implements the bias-corrected Adam-style server optimizer described in
+Section 3.1 of the paper (Equations 3 to 6):
 
-    Δ_t  = FedAvg(client_parameters) − w_t       (aggregated pseudo-gradient)
-    m_t  = β₁ · m_{t-1} + (1 − β₁) · Δ_t         (Equation 4, 1st moment)
-    v_t  = β₂ · v_{t-1} + (1 − β₂) · Δ_t²        (Equation 4, 2nd moment)
-    m̂_t  = m_t / (1 − β₁ᵗ)                       (Equation 5, bias correction)
-    v̂_t  = v_t / (1 − β₂ᵗ)                       (Equation 5, bias correction)
-    w_{t+1} = w_t + η · m̂_t / (√v̂_t + ε_opt)     (Equation 6, server update)
+    Delta_t = FedAvg(client_parameters) - w_t          (Eq. 3, pseudo-gradient)
+    m_t     = beta_1 * m_{t-1} + (1 - beta_1) * Delta_t  (Eq. 4, 1st moment)
+    v_t     = beta_2 * v_{t-1} + (1 - beta_2) * Delta_t^2 (Eq. 4, 2nd moment)
+    m_hat_t = m_t / (1 - beta_1^t)                     (Eq. 5, bias correction)
+    v_hat_t = v_t / (1 - beta_2^t)                     (Eq. 5, bias correction)
+    w_{t+1} = w_t + eta * m_hat_t / (sqrt(v_hat_t) + eps_opt)  (Eq. 6, update)
 
-Default hyper-parameters follow Section 3.5 of the paper:
-    η = 1.0 (server learning rate), β₁ = 0.9, β₂ = 0.999, ε_opt = 1e-8.
-η is configurable; setting η = 0 disables the server optimiser entirely so
-the strategy degenerates to plain FedAvg (used for the baseline).
+Note the + sign in Eq. 6: Delta_t is the improvement direction
+(aggregated params minus current params), so the server adds the
+Adam-smoothed pseudo-gradient to the current model.
 
-The very first aggregation bootstraps the server state from the aggregated
-parameters (no artificial zero-initialised pseudo-gradient).
+Default hyperparameters (Section 3.5 of the paper):
+    eta = 1.0, beta_1 = 0.9, beta_2 = 0.999, eps_opt = 1e-8
+
+Setting eta = 0.0 disables the server optimizer entirely, reducing the
+strategy to plain FedAvg (used as the baseline in the experiments).
+
+Authors: Rodrigo Tertulino, Ricardo Almeida, Laercio Alencar
+IFRN - Federal Institute of Education, Science and Technology of
+Rio Grande do Norte, Mossoró, RN, Brazil.
+Repository: https://github.com/rodrigoronner/fedcvr
 """
 
 from __future__ import annotations
@@ -38,15 +47,15 @@ from flwr.server.strategy import FedAvg
 
 
 class FedCVRStrategy(FedAvg):
-    """FedAvg + Adam-style server optimiser + per-client metric logging.
+    """FedAvg + Adam-style server optimizer.
 
     Parameters
     ----------
-    eta     : Server learning rate η (paper default 1.0; 0 disables Adam).
-    beta_1  : Exponential decay for the 1st moment (β₁ = 0.9).
-    beta_2  : Exponential decay for the 2nd moment (β₂ = 0.999).
-    eps_opt : Numerical stability constant ε_opt (1e-8).
-    **kwargs: Forwarded verbatim to ``FedAvg.__init__``.
+    eta     : Server learning rate eta (paper Section 3.5: 1.0).
+    beta_1  : Exponential decay for the 1st moment (beta_1 = 0.9).
+    beta_2  : Exponential decay for the 2nd moment (beta_2 = 0.999).
+    eps_opt : Numerical stability constant epsilon_opt (1e-8).
+    **kwargs: Forwarded verbatim to FedAvg.__init__.
     """
 
     def __init__(
@@ -59,23 +68,18 @@ class FedCVRStrategy(FedAvg):
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
-        self.eta = eta
-        self.beta_1 = beta_1
-        self.beta_2 = beta_2
+        self.eta     = eta
+        self.beta_1  = beta_1
+        self.beta_2  = beta_2
         self.eps_opt = eps_opt
 
         self._m: Optional[List[np.ndarray]] = None
         self._v: Optional[List[np.ndarray]] = None
         self._current_weights: Optional[List[np.ndarray]] = None
-        self._t: int = 0  # Adam timestep (independent of server_round)
+        self._t: int = 0
 
-        # Metric history: {round: {cid: {metric: value}}}
-        self.client_metrics_history: Dict[int, Dict[str, Dict]] = {}
+        self.client_metrics_history: Dict[int, Dict] = {}
         self.final_weights: Optional[Parameters] = None
-
-    # ------------------------------------------------------------------
-    # Fit aggregation – apply server Adam optimiser
-    # ------------------------------------------------------------------
 
     def aggregate_fit(
         self,
@@ -83,6 +87,7 @@ class FedCVRStrategy(FedAvg):
         results: List[Tuple[ClientProxy, FitRes]],
         failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
     ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
+
         aggregated_parameters, aggregated_metrics = super().aggregate_fit(
             server_round, results, failures
         )
@@ -91,26 +96,26 @@ class FedCVRStrategy(FedAvg):
 
         aggregated_ndarrays = parameters_to_ndarrays(aggregated_parameters)
 
-        # η = 0 → plain FedAvg (baseline behaviour)
+        # eta = 0.0 -> plain FedAvg baseline
         if self.eta == 0.0:
             self.final_weights = aggregated_parameters
             return aggregated_parameters, aggregated_metrics
 
-        # Bootstrap: adopt the first aggregation as the initial server state
+        # Bootstrap: first round initializes server state
         if self._current_weights is None:
             self._current_weights = [np.copy(p) for p in aggregated_ndarrays]
-            self._m = [np.zeros_like(p) for p in aggregated_ndarrays]
-            self._v = [np.zeros_like(p) for p in aggregated_ndarrays]
+            self._m   = [np.zeros_like(p) for p in aggregated_ndarrays]
+            self._v   = [np.zeros_like(p) for p in aggregated_ndarrays]
             self.final_weights = ndarrays_to_parameters(self._current_weights)
             return self.final_weights, aggregated_metrics
 
-        # Pseudo-gradient (Equation 3)
+        # Eq. 3: pseudo-gradient = aggregated params - current params
         delta = [
             agg - cur
             for agg, cur in zip(aggregated_ndarrays, self._current_weights)
         ]
 
-        # Moment updates (Equation 4)
+        # Eq. 4: moment updates
         self._t += 1
         t = self._t
         self._m = [
@@ -122,24 +127,20 @@ class FedCVRStrategy(FedAvg):
             for v_prev, d in zip(self._v, delta)
         ]
 
-        # Bias correction (Equation 5)
+        # Eq. 5: bias correction
         m_hat = [m / (1.0 - self.beta_1 ** t) for m in self._m]
         v_hat = [v / (1.0 - self.beta_2 ** t) for v in self._v]
 
-        # Server update (Equation 6)
+        # Eq. 6: server parameter update (+ sign: pseudo-gradient is improvement direction)
         new_weights = [
             w + self.eta * mh / (np.sqrt(vh) + self.eps_opt)
             for w, mh, vh in zip(self._current_weights, m_hat, v_hat)
         ]
 
         self._current_weights = new_weights
-        updated_parameters = ndarrays_to_parameters(new_weights)
-        self.final_weights = updated_parameters
+        updated_parameters    = ndarrays_to_parameters(new_weights)
+        self.final_weights    = updated_parameters
         return updated_parameters, aggregated_metrics
-
-    # ------------------------------------------------------------------
-    # Evaluate aggregation – collect per-client metrics
-    # ------------------------------------------------------------------
 
     def aggregate_evaluate(
         self,
@@ -152,7 +153,7 @@ class FedCVRStrategy(FedAvg):
         )
         if results:
             self.client_metrics_history[server_round] = {
-                client_proxy.cid: {"loss": res.loss, **res.metrics}
-                for client_proxy, res in results
+                proxy.cid: {"loss": res.loss, **res.metrics}
+                for proxy, res in results
             }
         return aggregated_loss, aggregated_metrics

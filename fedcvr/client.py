@@ -1,24 +1,36 @@
 """
-client.py – FedCVR Flower client.
+fedcvr/client.py
+================
+FedCVR Flower client implementing local training and client-level
+Differential Privacy.
 
-Implements the client-side behaviour described in Sections 3.1 and 3.5 of
-the paper:
+Local training (Section 3.1 of the paper)
+------------------------------------------
+Each client trains the global model on its private dataset for E=5 local
+epochs using the Adam optimizer (lr=0.001) and binary cross-entropy loss
+on sigmoid outputs (BCELoss).
 
-1. Local training with the Adam optimiser (learning rate 0.001), batch
-   size 32, binary cross-entropy loss on sigmoid probabilities (BCELoss),
-   for 5 local epochs per communication round.
+Client-level Differential Privacy (Equations 8 and 9)
+------------------------------------------------------
+After local training, the client computes the update vector:
 
-2. Client-side Differential Privacy applied to the MODEL UPDATE before
-   transmission (Equations 8 and 9 of the paper):
+    Delta_theta = theta_local - theta_global           (Eq. 7)
 
-       Δθ      = θ_local − θ_global                       (update vector)
-       Δθ_clip = Δθ · min(1, C / ‖Δθ‖₂)                   (Equation 8)
-       Δθ̃     = Δθ_clip + N(0, σ²C²I)                     (Equation 9)
+It then clips the global L2 norm of this vector to C and adds
+calibrated Gaussian noise:
 
-   The perturbed update is added back to the received global parameters
-   and transmitted, so the server never observes the unperturbed update.
-   This realises the client-level differential privacy guarantee
-   discussed in Section 3.1.3 of the paper.
+    Delta_clip = Delta_theta * min(1, C / ||Delta_theta||_2)  (Eq. 8)
+    Delta_noisy = Delta_clip + N(0, sigma^2 * C^2 * I)        (Eq. 9)
+
+The noisy update is sent to the server; the server never receives the
+unperturbed update.  This provides client-level DP: an adversary
+observing all server-side information cannot reliably determine whether
+a given institution participated in a given round.
+
+Authors: Rodrigo Tertulino, Ricardo Almeida, Laercio Alencar
+IFRN - Federal Institute of Education, Science and Technology of
+Rio Grande do Norte, Mossoró, RN, Brazil.
+Repository: https://github.com/rodrigoronner/fedcvr
 """
 
 from __future__ import annotations
@@ -43,53 +55,44 @@ from torch.utils.data import DataLoader, TensorDataset
 from .model import Net
 
 
-# ---------------------------------------------------------------------------
-# Differential Privacy at the update level (paper Equations 8 and 9)
-# ---------------------------------------------------------------------------
-
 def privatize_update(
     delta: List[np.ndarray],
     max_grad_norm: float,
     noise_multiplier: float,
     rng: np.random.Generator,
 ) -> List[np.ndarray]:
-    """Clip the flattened update to L2 norm C and add Gaussian noise.
+    """Clip and perturb the update vector (Equations 8 and 9).
 
     Parameters
     ----------
-    delta            : list of per-layer update arrays (θ_local − θ_global).
-    max_grad_norm    : clipping norm C (paper uses C = 1.0).
-    noise_multiplier : σ; noise std is σ·C per coordinate (Equation 9).
-    rng              : numpy random Generator (seeded for reproducibility).
+    delta           : Per-layer list of update arrays (theta_local - theta_global).
+    max_grad_norm   : Clipping norm C.
+    noise_multiplier: sigma; noise standard deviation is sigma * C.
+    rng             : Seeded numpy random Generator for reproducibility.
     """
-    # Global L2 norm across all layers
     total_norm = float(np.sqrt(sum(float((d ** 2).sum()) for d in delta)))
-    clip_coef = min(1.0, max_grad_norm / (total_norm + 1e-12))
-    clipped = [d * clip_coef for d in delta]
+    clip_coef  = min(1.0, max_grad_norm / (total_norm + 1e-12))
+    clipped    = [d * clip_coef for d in delta]
 
-    noise_std = noise_multiplier * max_grad_norm
-    noisy = [
+    noise_std  = noise_multiplier * max_grad_norm
+    noisy      = [
         c + rng.normal(loc=0.0, scale=noise_std, size=c.shape).astype(c.dtype)
         for c in clipped
     ]
     return noisy
 
 
-# ---------------------------------------------------------------------------
-# Flower client
-# ---------------------------------------------------------------------------
-
 class FedCVRClient(NumPyClient):
-    """Flower client implementing the paper's local training and DP.
+    """Flower NumPyClient implementing FedCVR local training.
 
     Parameters
     ----------
-    model        : Initialised ``Net`` instance.
+    model        : Initialized Net instance.
     train_loader : DataLoader for local training data.
     test_loader  : DataLoader for local evaluation data.
-    local_epochs : Local epochs per communication round (paper: 5).
-    use_dp       : Whether to apply client-side DP to the update.
-    dp_config    : Dict with keys ``noise_multiplier`` and ``max_grad_norm``.
+    local_epochs : Local SGD epochs per communication round (paper: 5).
+    use_dp       : Whether to apply client-level DP to the update.
+    dp_config    : Dict with keys noise_multiplier and max_grad_norm.
     seed         : Seed for the DP noise generator.
     """
 
@@ -103,37 +106,29 @@ class FedCVRClient(NumPyClient):
         dp_config: Optional[Dict] = None,
         seed: int = 42,
     ) -> None:
-        self.model = model
+        self.model        = model
         self.train_loader = train_loader
-        self.test_loader = test_loader
+        self.test_loader  = test_loader
         self.local_epochs = local_epochs
-        self.use_dp = use_dp
-        self.dp_config = dp_config or {}
-        self._rng = np.random.default_rng(seed)
+        self.use_dp       = use_dp
+        self.dp_config    = dp_config or {}
+        self._rng         = np.random.default_rng(seed)
 
-        # Paper, Section 3.5: Adam at the client, learning rate 0.001
+        # Section 3.5: Adam at the client, lr = 0.001
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-        # Paper, Section 3.5: binary cross-entropy on sigmoid outputs
+        # Section 3.5: binary cross-entropy on sigmoid outputs
         self.criterion = nn.BCELoss()
 
         if self.use_dp and not self.dp_config:
             raise ValueError("dp_config must be provided when use_dp=True")
-
-    # ------------------------------------------------------------------
-    # Parameter (de)serialisation
-    # ------------------------------------------------------------------
 
     def get_parameters(self, config: Dict) -> List[np.ndarray]:
         return [val.cpu().numpy() for val in self.model.state_dict().values()]
 
     def set_parameters(self, parameters: List[np.ndarray]) -> None:
         params_dict = zip(self.model.state_dict().keys(), parameters)
-        state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+        state_dict  = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
         self.model.load_state_dict(state_dict, strict=True)
-
-    # ------------------------------------------------------------------
-    # Federated fit: local training + optional DP on the update
-    # ------------------------------------------------------------------
 
     def fit(
         self, parameters: List[np.ndarray], config: Dict
@@ -146,31 +141,26 @@ class FedCVRClient(NumPyClient):
             for features, labels in self.train_loader:
                 self.optimizer.zero_grad()
                 outputs = self.model(features)
-                loss = self.criterion(outputs, labels)
+                loss    = self.criterion(outputs, labels)
                 loss.backward()
                 self.optimizer.step()
 
         local_params = self.get_parameters({})
 
         if self.use_dp:
-            # Equations 8 and 9: clip the update, add Gaussian noise,
-            # transmit only the perturbed information.
-            delta = [lp - gp for lp, gp in zip(local_params, global_params)]
+            # Equations 8 and 9: clip update, add Gaussian noise.
+            delta      = [lp - gp for lp, gp in zip(local_params, global_params)]
             noisy_delta = privatize_update(
                 delta,
-                max_grad_norm=self.dp_config["max_grad_norm"],
-                noise_multiplier=self.dp_config["noise_multiplier"],
-                rng=self._rng,
+                max_grad_norm   = self.dp_config["max_grad_norm"],
+                noise_multiplier = self.dp_config["noise_multiplier"],
+                rng             = self._rng,
             )
             out_params = [gp + nd for gp, nd in zip(global_params, noisy_delta)]
         else:
             out_params = local_params
 
         return out_params, len(self.train_loader.dataset), {}
-
-    # ------------------------------------------------------------------
-    # Federated evaluate: local test metrics
-    # ------------------------------------------------------------------
 
     def evaluate(
         self, parameters: List[np.ndarray], config: Dict
@@ -179,12 +169,12 @@ class FedCVRClient(NumPyClient):
         self.model.eval()
 
         all_labels: List[float] = []
-        all_probs: List[float] = []
+        all_probs:  List[float] = []
         total_loss = 0.0
 
         with torch.no_grad():
             for features, labels in self.test_loader:
-                probs = self.model(features)
+                probs       = self.model(features)
                 total_loss += self.criterion(probs, labels).item() * len(labels)
                 all_labels.extend(labels.numpy().flatten().tolist())
                 all_probs.extend(probs.numpy().flatten().tolist())
@@ -193,32 +183,28 @@ class FedCVRClient(NumPyClient):
         if n == 0:
             return 0.0, 0, {}
 
-        y_true = np.array(all_labels)
-        y_prob = np.array(all_probs)
-        y_pred = (y_prob >= 0.5).astype(int)
+        y_true   = np.array(all_labels)
+        y_prob   = np.array(all_probs)
+        y_pred   = (y_prob >= 0.5).astype(int)
         avg_loss = total_loss / n
 
         try:
             auc = float(roc_auc_score(y_true, y_prob))
-        except ValueError:  # single-class test split
+        except ValueError:
             auc = float("nan")
 
         return (
             float(avg_loss),
             n,
             {
-                "accuracy": float(accuracy_score(y_true, y_pred)),
+                "accuracy" : float(accuracy_score(y_true, y_pred)),
                 "precision": float(precision_score(y_true, y_pred, zero_division=0)),
-                "recall": float(recall_score(y_true, y_pred, zero_division=0)),
-                "f1_score": float(f1_score(y_true, y_pred, zero_division=0)),
-                "auc": auc,
+                "recall"   : float(recall_score(y_true, y_pred, zero_division=0)),
+                "f1_score" : float(f1_score(y_true, y_pred, zero_division=0)),
+                "auc"      : auc,
             },
         )
 
-
-# ---------------------------------------------------------------------------
-# Factory helper
-# ---------------------------------------------------------------------------
 
 def build_client(
     cid: str,
@@ -230,17 +216,14 @@ def build_client(
     dp_config: Optional[Dict] = None,
     seed: int = 42,
 ) -> "FedCVRClient":
-    """Construct a ``FedCVRClient`` from pre-split numpy arrays.
-
-    Batch size is 32 in all regimes, matching Section 3.5 of the paper.
-    """
-    idx = int(cid)
+    """Construct a FedCVRClient from pre-split numpy arrays."""
+    idx      = int(cid)
     X_train, y_train = client_train_data[idx]
-    X_test, y_test = client_test_data[idx]
+    X_test,  y_test  = client_test_data[idx]
 
     model = Net(input_features=X_train.shape[1])
 
-    def _to_loader(X, y, shuffle=False):
+    def _loader(X, y, shuffle=False):
         return DataLoader(
             TensorDataset(
                 torch.tensor(X, dtype=torch.float32),
@@ -250,15 +233,12 @@ def build_client(
             shuffle=shuffle,
         )
 
-    train_loader = _to_loader(X_train, y_train, shuffle=True)
-    test_loader = _to_loader(X_test, y_test)
-
     return FedCVRClient(
-        model=model,
-        train_loader=train_loader,
-        test_loader=test_loader,
-        local_epochs=local_epochs,
-        use_dp=use_dp,
-        dp_config=dp_config,
-        seed=seed + idx,
+        model        = model,
+        train_loader = _loader(X_train, y_train, shuffle=True),
+        test_loader  = _loader(X_test, y_test),
+        local_epochs = local_epochs,
+        use_dp       = use_dp,
+        dp_config    = dp_config,
+        seed         = seed + idx,
     )
